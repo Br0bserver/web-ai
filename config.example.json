@@ -1,0 +1,35 @@
+{
+  "server": {
+    "port": 8080,
+    "data_dir": "data"
+  },
+  "auth": {
+    "allowed_user_ids": ["alice", "bob"]
+  },
+  "provider": {
+    "name": "Default Provider",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "sk-xxx",
+    "timeout_seconds": 300
+  },
+  "models": [
+    {
+      "id": "gpt-4o-mini",
+      "name": "GPT 4o Mini",
+      "avatar": "/avatars/brands/openai.svg"
+    },
+    {
+      "id": "deepseek-chat",
+      "name": "DeepSeek Chat",
+      "avatar": "/avatars/brands/deepseek.svg"
+    }
+  ],
+  "title_model": {
+    "id": "gpt-4o-mini",
+    "name": "Cheap Title Model",
+    "prompt": "You generate concise conversation titles. Read the first user message and first assistant reply, then output a short title in the same language as the conversation. Output title text only, with no quotes, prefixes, markdown, or punctuation unless the language naturally needs it."
+  },
+  "ui": {
+    "title": "Web AI"
+  }
+}
