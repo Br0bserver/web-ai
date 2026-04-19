@@ -1,5 +1,5 @@
 web-ai
-server
+/server
 
 config.json
 .env
