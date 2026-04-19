@@ -28,6 +28,11 @@ type StreamDelta struct {
 	ThinkDelta   string
 }
 
+type RequestOptions struct {
+	EnableThinking bool
+	EnableSearch   bool
+}
+
 func NewClient(baseURL, apiKey string, timeoutSeconds int) *Client {
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 300
@@ -39,12 +44,13 @@ func NewClient(baseURL, apiKey string, timeoutSeconds int) *Client {
 	}
 }
 
-func (c *Client) Chat(ctx context.Context, modelID string, messages []Message) (string, error) {
+func (c *Client) Chat(ctx context.Context, modelID string, messages []Message, options RequestOptions) (string, error) {
 	requestBody := map[string]any{
 		"model":    modelID,
 		"messages": messages,
 		"stream":   false,
 	}
+	applyRequestOptions(requestBody, options)
 	body, err := json.Marshal(requestBody)
 	if err != nil {
 		return "", err
@@ -91,7 +97,7 @@ func (c *Client) Chat(ctx context.Context, modelID string, messages []Message) (
 	return content, nil
 }
 
-func (c *Client) ChatStream(ctx context.Context, modelID string, messages []Message, onDelta func(StreamDelta) error) (string, string, error) {
+func (c *Client) ChatStream(ctx context.Context, modelID string, messages []Message, options RequestOptions, onDelta func(StreamDelta) error) (string, string, error) {
 	requestBody := map[string]any{
 		"model":    modelID,
 		"messages": messages,
@@ -100,6 +106,7 @@ func (c *Client) ChatStream(ctx context.Context, modelID string, messages []Mess
 			"include_usage": true,
 		},
 	}
+	applyRequestOptions(requestBody, options)
 	body, err := json.Marshal(requestBody)
 	if err != nil {
 		return "", "", err
@@ -199,4 +206,13 @@ func firstString(payload map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func applyRequestOptions(requestBody map[string]any, options RequestOptions) {
+	if options.EnableThinking {
+		requestBody["enable_thinking"] = true
+	}
+	if options.EnableSearch {
+		requestBody["enable_search"] = true
+	}
 }

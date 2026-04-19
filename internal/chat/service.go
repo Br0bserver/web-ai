@@ -25,11 +25,16 @@ type StreamChunk struct {
 	ThinkPreview string `json:"think_preview,omitempty"`
 }
 
+type GenerationOptions struct {
+	EnableThinking bool
+	EnableSearch   bool
+}
+
 func NewService(cfg *config.Config, st *store.Store, renderer *render.Renderer, client *openai.Client) *Service {
 	return &Service{cfg: cfg, store: st, renderer: renderer, client: client}
 }
 
-func (s *Service) SendMessage(ctx context.Context, userID, conversationID, modelID, input string) (*store.Message, error) {
+func (s *Service) SendMessage(ctx context.Context, userID, conversationID, modelID, input string, options GenerationOptions) (*store.Message, error) {
 	input = strings.TrimSpace(input)
 	if input == "" {
 		return nil, fmt.Errorf("message is required")
@@ -71,7 +76,11 @@ func (s *Service) SendMessage(ctx context.Context, userID, conversationID, model
 	}
 	upstreamMessages = append(upstreamMessages, openai.Message{Role: "user", Content: input})
 
-	response, err := s.client.Chat(ctx, modelID, upstreamMessages)
+	requestOptions := sanitizeGenerationOptions(modelID, options)
+	response, err := s.client.Chat(ctx, modelID, upstreamMessages, openai.RequestOptions{
+		EnableThinking: requestOptions.EnableThinking,
+		EnableSearch:   requestOptions.EnableSearch,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +103,7 @@ func (s *Service) SendMessage(ctx context.Context, userID, conversationID, model
 	return assistantMessage, nil
 }
 
-func (s *Service) StreamMessage(ctx context.Context, userID, conversationID, modelID, input string, onChunk func(StreamChunk) error) (*store.Message, error) {
+func (s *Service) StreamMessage(ctx context.Context, userID, conversationID, modelID, input string, options GenerationOptions, onChunk func(StreamChunk) error) (*store.Message, error) {
 	input = strings.TrimSpace(input)
 	if input == "" {
 		return nil, fmt.Errorf("message is required")
@@ -136,8 +145,12 @@ func (s *Service) StreamMessage(ctx context.Context, userID, conversationID, mod
 	}
 	upstreamMessages = append(upstreamMessages, openai.Message{Role: "user", Content: input})
 
+	requestOptions := sanitizeGenerationOptions(modelID, options)
 	var liveThink strings.Builder
-	content, thinking, err := s.client.ChatStream(ctx, modelID, upstreamMessages, func(delta openai.StreamDelta) error {
+	content, thinking, err := s.client.ChatStream(ctx, modelID, upstreamMessages, openai.RequestOptions{
+		EnableThinking: requestOptions.EnableThinking,
+		EnableSearch:   requestOptions.EnableSearch,
+	}, func(delta openai.StreamDelta) error {
 		if onChunk == nil {
 			return nil
 		}
@@ -178,6 +191,50 @@ func (s *Service) StreamMessage(ctx context.Context, userID, conversationID, mod
 	return assistantMessage, nil
 }
 
+func (s *Service) SavePartialAssistant(ctx context.Context, userID, conversationID, modelID, content, thinkContent string) (*store.Message, error) {
+	content = strings.TrimSpace(content)
+	thinkContent = strings.TrimSpace(thinkContent)
+	if content == "" && thinkContent == "" {
+		return nil, fmt.Errorf("partial content is empty")
+	}
+
+	conversation, err := s.store.GetConversation(conversationID)
+	if err != nil {
+		return nil, err
+	}
+	if conversation == nil || conversation.UserID != userID {
+		return nil, fmt.Errorf("conversation not found")
+	}
+	if modelID == "" {
+		modelID = conversation.ModelID
+	}
+	if _, ok := s.cfg.ModelByID(modelID); !ok {
+		return nil, fmt.Errorf("unknown model")
+	}
+	if conversation.ModelID != modelID {
+		if err := s.store.UpdateConversation(conversation.ID, conversation.Title, modelID); err != nil {
+			return nil, err
+		}
+	}
+
+	finalRaw := content
+	if thinkContent != "" {
+		if content == "" {
+			finalRaw = "<think>\n" + thinkContent + "\n</think>"
+		} else {
+			finalRaw = "<think>\n" + thinkContent + "\n</think>\n\n" + content
+		}
+	}
+
+	assistantHTML := s.renderer.RenderMarkdown(content)
+	assistantMessage, err := s.store.AddMessage(conversationID, "assistant", modelID, finalRaw, assistantHTML)
+	if err != nil {
+		return nil, err
+	}
+	assistantMessage.ThinkContent = thinkContent
+	return assistantMessage, nil
+}
+
 func (s *Service) generateTitle(conversationID, firstUser, firstAssistant string) {
 	prompt := strings.TrimSpace(s.cfg.TitleModel.Prompt)
 	if prompt == "" {
@@ -189,7 +246,7 @@ func (s *Service) generateTitle(conversationID, firstUser, firstAssistant string
 		title, err := s.client.Chat(timeoutCtx, s.cfg.TitleModel.ID, []openai.Message{
 			{Role: "system", Content: prompt},
 			{Role: "user", Content: content},
-		})
+		}, openai.RequestOptions{})
 		cancel()
 		if err != nil {
 			time.Sleep(time.Duration(attempt+1) * 800 * time.Millisecond)
@@ -271,4 +328,38 @@ func sanitizeTitle(title string) string {
 		return ""
 	}
 	return title
+}
+
+func sanitizeGenerationOptions(modelID string, options GenerationOptions) GenerationOptions {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	if modelID == "" {
+		return GenerationOptions{}
+	}
+	if options.EnableThinking && !supportsThinking(modelID) {
+		options.EnableThinking = false
+	}
+	if options.EnableSearch && !supportsSearch(modelID) {
+		options.EnableSearch = false
+	}
+	return options
+}
+
+func supportsThinking(modelID string) bool {
+	keywords := []string{"reason", "r1", "o1", "o3", "thinking", "qwq", "deepseek", "grok", "gemini", "gpt", "claude", "qwen", "glm", "xai", "llama", "mistral"}
+	for _, keyword := range keywords {
+		if strings.Contains(modelID, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func supportsSearch(modelID string) bool {
+	keywords := []string{"search", "sonar", "联网", "web", "browse", "online", "gemini", "grok", "perplexity", "deepseek", "qwen"}
+	for _, keyword := range keywords {
+		if strings.Contains(modelID, keyword) {
+			return true
+		}
+	}
+	return false
 }

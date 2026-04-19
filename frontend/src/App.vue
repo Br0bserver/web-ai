@@ -335,6 +335,65 @@ function previewLines(text, count) {
   return lines.slice(lines.length - count).join('\n')
 }
 
+function suffixPrefixLength(value, token) {
+  var max = Math.min(value.length, token.length - 1)
+  var i
+  var lowerValue = value.toLowerCase()
+  var lowerToken = token.toLowerCase()
+  for (i = max; i > 0; i -= 1) {
+    if (lowerToken.indexOf(lowerValue.slice(lowerValue.length - i)) === 0) {
+      return i
+    }
+  }
+  return 0
+}
+
+function splitThinkFromContentDelta(delta, parserState) {
+  var openTag = '<think>'
+  var closeTag = '</think>'
+  var state = parserState || { inThink: false, pending: '' }
+  var source = String((state.pending || '') + (delta || ''))
+  var lower = source.toLowerCase()
+  var index = 0
+  var answer = ''
+  var think = ''
+  var inThink = !!state.inThink
+  var pending = ''
+  var marker
+  var hold
+  while (index < source.length) {
+    if (!inThink) {
+      marker = lower.indexOf(openTag, index)
+      if (marker < 0) {
+        hold = suffixPrefixLength(source.slice(index), openTag)
+        answer += source.slice(index, source.length - hold)
+        pending = source.slice(source.length - hold)
+        break
+      }
+      answer += source.slice(index, marker)
+      inThink = true
+      index = marker + openTag.length
+      continue
+    }
+    marker = lower.indexOf(closeTag, index)
+    if (marker < 0) {
+      hold = suffixPrefixLength(source.slice(index), closeTag)
+      think += source.slice(index, source.length - hold)
+      pending = source.slice(source.length - hold)
+      break
+    }
+    think += source.slice(index, marker)
+    inThink = false
+    index = marker + closeTag.length
+  }
+  return {
+    contentDelta: answer,
+    thinkDelta: think,
+    inThink: inThink,
+    pending: pending
+  }
+}
+
 export default {
   name: 'App',
   data: function () {
@@ -359,6 +418,8 @@ export default {
       titleRefreshTimer: 0,
       activeStreamXHR: null,
       streamPendingId: '',
+      streamPendingUserId: '',
+      streamStoppedByUser: false,
       streamThinkExpanded: {},
       editingMessageId: 0,
       editingMessageDraft: '',
@@ -522,9 +583,6 @@ export default {
       for (i = 0; i < this.conversations.length; i += 1) {
         if (this.currentConversation && this.currentConversation.id === this.conversations[i].id) {
           this.currentConversation = this.conversations[i]
-          if (this.currentConversation.model_id) {
-            this.selectedModelId = this.currentConversation.model_id
-          }
           return
         }
       }
@@ -533,6 +591,7 @@ export default {
       var self = this
       this.abortActiveStream()
       this.streamPendingId = ''
+      this.streamPendingUserId = ''
       createXHR('POST', '/api/conversations', { model_id: this.selectedModelId }, this.token, function (err, data) {
         if (err) {
           self.chatError = err.message
@@ -554,6 +613,7 @@ export default {
       var self = this
       this.abortActiveStream()
       this.streamPendingId = ''
+      this.streamPendingUserId = ''
       this.sending = false
       this.editingMessageId = 0
       createXHR('GET', '/api/conversations/' + conversationId + '/messages', null, this.token, function (err, data) {
@@ -589,6 +649,7 @@ export default {
       if (this.currentConversation && this.currentConversation.id === conversationId) {
         this.abortActiveStream()
         this.streamPendingId = ''
+        this.streamPendingUserId = ''
         this.sending = false
       }
       createXHR('DELETE', '/api/conversations/' + conversationId, null, this.token, function (err) {
@@ -617,9 +678,9 @@ export default {
       })
     },
     sendMessage: function () {
-      this.sendMessageCore(this.trimmedDraft)
+      this.sendMessageCore(this.trimmedDraft, this.selectedModelId)
     },
-    sendMessageCore: function (text) {
+    sendMessageCore: function (text, forcedModelId) {
       var self = this
       var conversationId
       var optimisticUser
@@ -627,27 +688,30 @@ export default {
       var pendingAssistant
       var streamCompleted = false
       var stickBottom = this.isNearBottom()
+      var targetModelId
       text = String(text || '').replace(/^\s+|\s+$/g, '')
       if (this.sending || !text) {
         return
       }
       this.chatError = ''
+      targetModelId = forcedModelId || this.selectedModelId
       if (!this.currentConversation) {
         this.createConversation(function (err) {
           if (!err) {
-            self.sendMessageCore(text)
+            self.sendMessageCore(text, targetModelId)
           }
         })
         return
       }
 
+      this.clearTitleRefreshTimer()
       this.draft = ''
       this.editingMessageId = 0
       conversationId = this.currentConversation.id
       optimisticUser = {
         id: 'pending-user-' + new Date().getTime(),
         role: 'user',
-        model_id: this.selectedModelId,
+        model_id: targetModelId,
         content_raw: text,
         content_html: '<p>' + escapeHTML(text).replace(/\n/g, '<br>') + '</p>',
         created_at: new Date().toISOString()
@@ -656,28 +720,33 @@ export default {
       pendingAssistant = {
         id: 'pending-assistant-' + new Date().getTime(),
         role: 'assistant',
-        model_id: this.selectedModelId,
+        model_id: targetModelId,
         content_raw: '',
         content_html: '<p></p>',
         think_content: '',
+        _inThink: false,
+        _tagBuffer: '',
         created_at: new Date().toISOString()
       }
       this.messages.push(optimisticUser)
       this.messages.push(pendingAssistant)
       this.sending = true
+      this.streamStoppedByUser = false
+      this.streamPendingUserId = optimisticUserId
       this.streamPendingId = pendingAssistant.id
       this.abortActiveStream()
       this.scrollMessages(true)
 
       this.activeStreamXHR = createXHRStream('/api/chat/completions', {
         conversation_id: conversationId,
-        model_id: this.selectedModelId,
+        model_id: targetModelId,
         message: text,
         stream: true
       }, this.token, {
         onEvent: function (eventName, data) {
           var i
           var pending
+          var parsed
           if (!self.streamPendingId) return
           if (eventName === 'error') {
             self.chatError = (data && data.error) ? data.error : 'stream error'
@@ -692,12 +761,23 @@ export default {
             }
             if (!pending) return
             if (data && data.content_delta) {
-              pending.content_raw = (pending.content_raw || '') + data.content_delta
-              pending.content_html = '<p>' + escapeHTML(pending.content_raw).replace(/\n/g, '<br>') + '</p>'
+              parsed = splitThinkFromContentDelta(data.content_delta, {
+                inThink: !!pending._inThink,
+                pending: pending._tagBuffer || ''
+              })
+              pending._inThink = parsed.inThink
+              pending._tagBuffer = parsed.pending
+              if (parsed.contentDelta) {
+                pending.content_raw = (pending.content_raw || '') + parsed.contentDelta
+              }
+              if (parsed.thinkDelta) {
+                pending.think_content = (pending.think_content || '') + parsed.thinkDelta
+              }
             }
             if (data && data.think_delta) {
               pending.think_content = (pending.think_content || '') + data.think_delta
             }
+            pending.content_html = '<p>' + escapeHTML(pending.content_raw || '').replace(/\n/g, '<br>') + '</p>'
             if (stickBottom || self.isNearBottom()) {
               self.scrollMessages(true)
             }
@@ -709,19 +789,33 @@ export default {
         },
         onDone: function () {
           self.activeStreamXHR = null
+          if (self.streamStoppedByUser) {
+            self.streamStoppedByUser = false
+            return
+          }
           if (!streamCompleted) {
             self.sending = false
             self.removePendingAssistant()
             self.removeMessageById(optimisticUserId)
+            if (self.streamPendingUserId === optimisticUserId) {
+              self.streamPendingUserId = ''
+            }
             self.reloadConversationAndRecover(conversationId)
             self.chatError = self.chatError || '流式结束但未收到 done，已自动回补'
           }
         },
         onError: function (err) {
           self.activeStreamXHR = null
+          if (self.streamStoppedByUser) {
+            self.streamStoppedByUser = false
+            return
+          }
           self.sending = false
           self.removePendingAssistant()
           self.removeMessageById(optimisticUserId)
+          if (self.streamPendingUserId === optimisticUserId) {
+            self.streamPendingUserId = ''
+          }
           self.draft = text
           self.chatError = err && err.message ? err.message : 'stream error'
         }
@@ -734,16 +828,14 @@ export default {
       }
     },
     stopStreaming: function () {
+      this.streamStoppedByUser = true
       this.abortActiveStream()
-      this.sending = false
-      this.removePendingAssistant()
-      if (this.currentConversation) {
-        this.reloadConversationAndRecover(this.currentConversation.id)
-      }
+      this.finalizeStoppedStream()
     },
     finishStreamMessage: function (data, conversationId) {
       var i
       var doneMessage = data && data.message ? data.message : null
+      var self = this
       this.sending = false
       this.activeStreamXHR = null
       if (data && data.conversation) {
@@ -759,11 +851,15 @@ export default {
           break
         }
       }
+      if (this.streamPendingUserId) {
+        this.removeMessageById(this.streamPendingUserId)
+      }
       this.streamPendingId = ''
-      this.loadConversations(function () {})
-      this.scrollMessages(true)
-      this.refreshTitleUntilReady(conversationId)
-      this.focusComposer()
+      this.streamPendingUserId = ''
+      this.reloadCurrentConversation(function () {
+        self.refreshTitleUntilReady(conversationId)
+        self.focusComposer()
+      })
     },
     startMessageEdit: function (message) {
       if (this.sending || message.role !== 'user') {
@@ -782,6 +878,7 @@ export default {
       var self = this
       var text = this.editingMessageDraft.replace(/^\s+|\s+$/g, '')
       var messageId = this.editingMessageId
+      var targetModelId = this.selectedModelId
       if (!messageId || !text || this.sending) {
         return
       }
@@ -792,7 +889,7 @@ export default {
           return
         }
         self.cancelMessageEdit()
-        self.sendMessageCore(text)
+        self.sendMessageCore(text, targetModelId)
       })
     },
     deleteFromMessage: function (message) {
@@ -850,6 +947,7 @@ export default {
     regenerateFromAssistant: function (assistantMessage) {
       var self = this
       var promptMessage
+      var targetModelId = this.selectedModelId
       if (this.sending || assistantMessage.role !== 'assistant') {
         return
       }
@@ -863,7 +961,7 @@ export default {
           self.chatError = err.message
           return
         }
-        self.sendMessageCore(promptMessage.content_raw)
+        self.sendMessageCore(promptMessage.content_raw, targetModelId)
       })
     },
     findPreviousUserMessage: function (messageId) {
@@ -1032,6 +1130,78 @@ export default {
         } catch (e) {}
         this.activeStreamXHR = null
       }
+    },
+    finalizeStoppedStream: function () {
+      var i
+      var pending
+      var hasPartial
+      var conversationId
+      var self = this
+      this.sending = false
+      if (!this.streamPendingId) {
+        this.streamPendingUserId = ''
+        return
+      }
+      for (i = 0; i < this.messages.length; i += 1) {
+        if (this.messages[i].id === this.streamPendingId) {
+          pending = this.messages[i]
+          break
+        }
+      }
+      if (!pending) {
+        this.streamPendingId = ''
+        return
+      }
+      if (pending._tagBuffer) {
+        if (pending._inThink) {
+          pending.think_content = (pending.think_content || '') + pending._tagBuffer
+        } else {
+          pending.content_raw = (pending.content_raw || '') + pending._tagBuffer
+        }
+      }
+      pending._tagBuffer = ''
+      pending._inThink = false
+      hasPartial = !!((pending.content_raw || '').replace(/^\s+|\s+$/g, '') || (pending.think_content || '').replace(/^\s+|\s+$/g, ''))
+      conversationId = this.currentConversation ? this.currentConversation.id : ''
+      if (!hasPartial) {
+        this.removePendingAssistant()
+        if (this.streamPendingUserId) {
+          this.removeMessageById(this.streamPendingUserId)
+          this.streamPendingUserId = ''
+        }
+        if (conversationId) {
+          this.reloadConversationAndRecover(conversationId)
+        }
+        this.focusComposer()
+        return
+      }
+      this.streamPendingId = ''
+      this.streamPendingUserId = ''
+      if (!conversationId) {
+        this.focusComposer()
+        return
+      }
+      this.persistPartialAssistant(conversationId, pending, function (err) {
+        if (err) {
+          self.chatError = err.message || '保存中断输出失败'
+        }
+        self.reloadConversationAndRecover(conversationId)
+      })
+      this.focusComposer()
+    },
+    persistPartialAssistant: function (conversationId, pendingMessage, done) {
+      if (!conversationId || !pendingMessage) {
+        if (done) done(new Error('conversation missing'))
+        return
+      }
+      createXHR('POST', '/api/messages/partial', {
+        conversation_id: conversationId,
+        model_id: pendingMessage.model_id || this.selectedModelId,
+        content: pendingMessage.content_raw || '',
+        think_content: pendingMessage.think_content || ''
+      }, this.token, function (err) {
+        if (done) done(err || null)
+      })
     },
     removePendingAssistant: function () {
       var i
@@ -1813,6 +1983,12 @@ svg {
   align-items: center;
   justify-content: space-between;
   padding: 4px 0;
+}
+
+.composer-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .composer-left select {

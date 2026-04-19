@@ -40,6 +40,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/models", s.auth(http.HandlerFunc(s.handleModels)))
 	mux.Handle("/api/conversations", s.auth(http.HandlerFunc(s.handleConversations)))
 	mux.Handle("/api/conversations/", s.auth(http.HandlerFunc(s.handleConversationByID)))
+	mux.Handle("/api/messages/partial", s.auth(http.HandlerFunc(s.handlePartialAssistantMessage)))
 	mux.Handle("/api/messages/", s.auth(http.HandlerFunc(s.handleMessageByID)))
 	mux.Handle("/api/chat/completions", s.auth(http.HandlerFunc(s.handleChatCompletions)))
 	mux.Handle("/", spaHandler(http.FS(s.static)))
@@ -87,7 +88,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"user_id":    request.UserID,
 		"expires_at": expiresAt,
 	})
-	}
+}
 
 func (s *Server) handleSessionMe(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -107,8 +108,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"models":       s.cfg.Models,
-		"title_model":  s.cfg.TitleModel,
+		"models":        s.cfg.Models,
+		"title_model":   s.cfg.TitleModel,
 		"default_model": s.cfg.Models[0].ID,
 	})
 }
@@ -275,6 +276,45 @@ func (s *Server) handleMessageByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handlePartialAssistantMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w)
+		return
+	}
+	var request struct {
+		ConversationID string `json:"conversation_id"`
+		ModelID        string `json:"model_id"`
+		Content        string `json:"content"`
+		ThinkContent   string `json:"think_content"`
+	}
+	if err := decodeJSON(r.Body, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	message, err := s.chat.SavePartialAssistant(
+		r.Context(),
+		userIDFromContext(r.Context()),
+		strings.TrimSpace(request.ConversationID),
+		strings.TrimSpace(request.ModelID),
+		request.Content,
+		request.ThinkContent,
+	)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	conversation, _ := s.store.GetConversation(strings.TrimSpace(request.ConversationID))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message":      message,
+		"conversation": conversation,
+	})
+}
+
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeMethodNotAllowed(w)
@@ -285,6 +325,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ModelID        string `json:"model_id"`
 		Message        string `json:"message"`
 		Stream         bool   `json:"stream"`
+		EnableThinking bool   `json:"enable_thinking"`
+		EnableSearch   bool   `json:"enable_search"`
 	}
 	if err := decodeJSON(r.Body, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body")
@@ -292,10 +334,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	acceptStream := strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream")
 	if request.Stream || acceptStream {
-		s.handleChatCompletionsStream(w, r, strings.TrimSpace(request.ConversationID), strings.TrimSpace(request.ModelID), request.Message)
+		s.handleChatCompletionsStream(w, r, strings.TrimSpace(request.ConversationID), strings.TrimSpace(request.ModelID), request.Message, chat.GenerationOptions{
+			EnableThinking: request.EnableThinking,
+			EnableSearch:   request.EnableSearch,
+		})
 		return
 	}
-	message, err := s.chat.SendMessage(r.Context(), userIDFromContext(r.Context()), strings.TrimSpace(request.ConversationID), strings.TrimSpace(request.ModelID), request.Message)
+	message, err := s.chat.SendMessage(r.Context(), userIDFromContext(r.Context()), strings.TrimSpace(request.ConversationID), strings.TrimSpace(request.ModelID), request.Message, chat.GenerationOptions{
+		EnableThinking: request.EnableThinking,
+		EnableSearch:   request.EnableSearch,
+	})
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "not found") {
@@ -314,7 +362,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Request, conversationID, modelID, messageText string) {
+func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Request, conversationID, modelID, messageText string, options chat.GenerationOptions) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
@@ -324,7 +372,7 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	message, err := s.chat.StreamMessage(r.Context(), userIDFromContext(r.Context()), conversationID, modelID, messageText, func(chunk chat.StreamChunk) error {
+	message, err := s.chat.StreamMessage(r.Context(), userIDFromContext(r.Context()), conversationID, modelID, messageText, options, func(chunk chat.StreamChunk) error {
 		if err := writeSSE(w, "delta", chunk); err != nil {
 			return err
 		}
